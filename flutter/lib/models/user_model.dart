@@ -17,13 +17,23 @@ bool refreshingUser = false;
 class UserModel {
   final RxString userName = ''.obs;
   final RxBool isAdmin = false.obs;
+  final RxString networkError = ''.obs;
   bool get isLogin => userName.isNotEmpty;
   WeakReference<FFI> parent;
 
-  UserModel(this.parent);
+  UserModel(this.parent) {
+    userName.listen((p0) {
+      // When user name becomes empty, show login button
+      // When user name becomes non-empty:
+      //  For _updateLocalUserInfo, network error will be set later
+      //  For login success, should clear network error
+      networkError.value = '';
+    });
+  }
 
   void refreshCurrentUser() async {
     if (bind.isDisableAccount()) return;
+    networkError.value = '';
     final token = bind.mainGetLocalOption(key: 'access_token');
     if (token == '') {
       await updateOtherModels();
@@ -38,19 +48,25 @@ class UserModel {
     if (refreshingUser) return;
     try {
       refreshingUser = true;
-      final response = await http.post(Uri.parse('$url/api/currentUser'),
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': 'Bearer $token'
-          },
-          body: json.encode(body));
+      final http.Response response;
+      try {
+        response = await http.post(Uri.parse('$url/api/currentUser'),
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': 'Bearer $token'
+            },
+            body: json.encode(body));
+      } catch (e) {
+        networkError.value = e.toString();
+        rethrow;
+      }
       refreshingUser = false;
       final status = response.statusCode;
       if (status == 401 || status == 400) {
         reset(resetOther: status == 401);
         return;
       }
-      final data = json.decode(utf8.decode(response.bodyBytes));
+      final data = json.decode(decode_http_response(response));
       final error = data['error'];
       if (error != null) {
         throw error;
@@ -100,6 +116,10 @@ class UserModel {
     userName.value = user.name;
     isAdmin.value = user.isAdmin;
     bind.mainSetLocalOption(key: 'user_info', value: jsonEncode(user));
+    if (isWeb) {
+      // ugly here, tmp solution
+      bind.mainSetLocalOption(key: 'verifier', value: user.verifier ?? '');
+    }
   }
 
   // update ab and group status
@@ -140,7 +160,7 @@ class UserModel {
 
     final Map<String, dynamic> body;
     try {
-      body = jsonDecode(utf8.decode(resp.bodyBytes));
+      body = jsonDecode(decode_http_response(resp));
     } catch (e) {
       debugPrint("login: jsonDecode resp body failed: ${e.toString()}");
       if (resp.statusCode != 200) {
@@ -168,7 +188,9 @@ class UserModel {
       rethrow;
     }
 
-    if (loginResponse.user != null) {
+    final isLogInDone = loginResponse.type == HttpType.kAuthResTypeToken &&
+        loginResponse.access_token != null;
+    if (isLogInDone && loginResponse.user != null) {
       _parseAndUpdateUser(loginResponse.user!);
     }
 

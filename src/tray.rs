@@ -9,16 +9,32 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub fn start_tray() {
+    if crate::ui_interface::get_builtin_option(hbb_common::config::keys::OPTION_HIDE_TRAY) == "Y" {
+        #[cfg(target_os = "macos")]
+        {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            return;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    crate::server::check_zombie();
+
     allow_err!(make_tray());
 }
 
-pub fn make_tray() -> hbb_common::ResultType<()> {
+fn make_tray() -> hbb_common::ResultType<()> {
     // https://github.com/tauri-apps/tray-icon/blob/dev/examples/tao.rs
     use hbb_common::anyhow::Context;
     use tao::event_loop::{ControlFlow, EventLoopBuilder};
     use tray_icon::{
         menu::{Menu, MenuEvent, MenuItem},
-        TrayIconBuilder, TrayIconEvent as TrayEvent,
+        TrayIcon, TrayIconBuilder, TrayIconEvent as TrayEvent,
     };
     let icon;
     #[cfg(target_os = "macos")]
@@ -44,7 +60,7 @@ pub fn make_tray() -> hbb_common::ResultType<()> {
     let mut event_loop = EventLoopBuilder::new().build();
 
     let tray_menu = Menu::new();
-    let quit_i = MenuItem::new(translate("Exit".to_owned()), true, None);
+    let quit_i = MenuItem::new(translate("Stop service".to_owned()), true, None);
     let open_i = MenuItem::new(translate("Open".to_owned()), true, None);
     tray_menu.append_items(&[&open_i, &quit_i]).ok();
     let tooltip = |count: usize| {
@@ -63,15 +79,7 @@ pub fn make_tray() -> hbb_common::ResultType<()> {
             )
         }
     };
-    let _tray_icon = Some(
-        TrayIconBuilder::new()
-            .with_menu(Box::new(tray_menu))
-            .with_tooltip(tooltip(0))
-            .with_icon(icon)
-            .with_icon_as_template(true) // mac only
-            .build()?,
-    );
-    let _tray_icon = Arc::new(Mutex::new(_tray_icon));
+    let mut _tray_icon: Arc<Mutex<Option<TrayIcon>>> = Default::default();
 
     let menu_channel = MenuEvent::receiver();
     let tray_channel = TrayEvent::receiver();
@@ -94,12 +102,13 @@ pub fn make_tray() -> hbb_common::ResultType<()> {
             crate::run_me::<&str>(vec![]).ok();
         }
         #[cfg(target_os = "linux")]
-        if !std::process::Command::new("xdg-open")
-            .arg(&crate::get_uri_prefix())
-            .spawn()
-            .is_ok()
         {
-            crate::run_me::<&str>(vec![]).ok();
+            // Do not use "xdg-open", it won't read the config.
+            if crate::dbus::invoke_new_connection(crate::get_uri_prefix()).is_err() {
+                if let Ok(task) = crate::run_me::<&str>(vec![]) {
+                    crate::server::CHILD_PROCESS.lock().unwrap().push(task);
+                }
+            }
         }
     };
 
@@ -114,10 +123,37 @@ pub fn make_tray() -> hbb_common::ResultType<()> {
         use tao::platform::macos::EventLoopExtMacOS;
         event_loop.set_activation_policy(tao::platform::macos::ActivationPolicy::Accessory);
     }
-    event_loop.run(move |_event, _, control_flow| {
+    event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::WaitUntil(
             std::time::Instant::now() + std::time::Duration::from_millis(100),
         );
+
+        if let tao::event::Event::NewEvents(tao::event::StartCause::Init) = event {
+            // We create the icon once the event loop is actually running
+            // to prevent issues like https://github.com/tauri-apps/tray-icon/issues/90
+            let tray = TrayIconBuilder::new()
+                .with_menu(Box::new(tray_menu.clone()))
+                .with_tooltip(tooltip(0))
+                .with_icon(icon.clone())
+                .with_icon_as_template(true) // mac only
+                .build();
+            match tray {
+                Ok(tray) => _tray_icon = Arc::new(Mutex::new(Some(tray))),
+                Err(err) => {
+                    log::error!("Failed to create tray icon: {}", err);
+                }
+            };
+
+            // We have to request a redraw here to have the icon actually show up.
+            // Tao only exposes a redraw method on the Window so we use core-foundation directly.
+            #[cfg(target_os = "macos")]
+            unsafe {
+                use core_foundation::runloop::{CFRunLoopGetMain, CFRunLoopWakeUp};
+
+                let rl = CFRunLoopGetMain();
+                CFRunLoopWakeUp(rl);
+            }
+        }
 
         if let Ok(event) = menu_channel.try_recv() {
             if event.id == quit_i.id() {

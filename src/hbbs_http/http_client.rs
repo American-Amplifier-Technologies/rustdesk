@@ -6,15 +6,17 @@ use reqwest::Client as AsyncClient;
 
 macro_rules! configure_http_client {
     ($builder:expr, $Client: ty) => {{
-        let mut builder = $builder;
+        // https://github.com/rustdesk/rustdesk/issues/11569
+        // https://docs.rs/reqwest/latest/reqwest/struct.ClientBuilder.html#method.no_proxy
+        let mut builder = $builder.no_proxy();
         let client = if let Some(conf) = Config::get_socks() {
             let proxy_result = Proxy::from_conf(&conf, None);
 
             match proxy_result {
                 Ok(proxy) => {
                     let proxy_setup = match &proxy.intercept {
-                        ProxyScheme::Http { host, .. } =>{ reqwest::Proxy::http(format!("http://{}", host))},
-                        ProxyScheme::Https { host, .. } => {reqwest::Proxy::https(format!("https://{}", host))},
+                        ProxyScheme::Http { host, .. } =>{ reqwest::Proxy::all(format!("http://{}", host))},
+                        ProxyScheme::Https { host, .. } => {reqwest::Proxy::all(format!("https://{}", host))},
                         ProxyScheme::Socks5 { addr, .. } => { reqwest::Proxy::all(&format!("socks5://{}", addr)) }
                     };
 
@@ -24,14 +26,16 @@ macro_rules! configure_http_client {
                             if let Some(auth) = proxy.intercept.maybe_auth() {
                                 let basic_auth =
                                     format!("Basic {}", auth.get_basic_authorization());
-                                builder = builder.default_headers(
-                                    vec![(
-                                        reqwest::header::PROXY_AUTHORIZATION,
-                                        basic_auth.parse().unwrap(),
-                                    )]
-                                    .into_iter()
-                                    .collect(),
-                                );
+                                if let Ok(auth) = basic_auth.parse() {
+                                    builder = builder.default_headers(
+                                        vec![(
+                                            reqwest::header::PROXY_AUTHORIZATION,
+                                            auth,
+                                        )]
+                                        .into_iter()
+                                        .collect(),
+                                    );
+                                }
                             }
                             builder.build().unwrap_or_else(|e| {
                                 info!("Failed to create a proxied client: {}", e);

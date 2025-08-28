@@ -17,21 +17,23 @@ import '../common.dart';
 
 final syncAbOption = 'sync-ab-with-recent-sessions';
 bool shouldSyncAb() {
-  return bind.mainGetLocalOption(key: syncAbOption).isNotEmpty;
+  return bind.mainGetLocalOption(key: syncAbOption) == 'Y';
 }
 
 final sortAbTagsOption = 'sync-ab-tags';
 bool shouldSortTags() {
-  return bind.mainGetLocalOption(key: sortAbTagsOption).isNotEmpty;
+  return bind.mainGetLocalOption(key: sortAbTagsOption) == 'Y';
 }
 
 final filterAbTagOption = 'filter-ab-by-intersection';
 bool filterAbTagByIntersection() {
-  return bind.mainGetLocalOption(key: filterAbTagOption).isNotEmpty;
+  return bind.mainGetLocalOption(key: filterAbTagOption) == 'Y';
 }
 
 const _personalAddressBookName = "My address book";
 const _legacyAddressBookName = "Legacy address book";
+
+const kUntagged = "Untagged";
 
 enum ForcePullAb {
   listAndCurrent,
@@ -56,6 +58,9 @@ class AbModel {
   String? _personalAbGuid;
   RxBool legacyMode = false.obs;
 
+  // Only handles peers add/remove
+  final Map<String, VoidCallback> _peerIdUpdateListeners = {};
+
   final sortTags = shouldSortTags().obs;
   final filterByIntersection = filterAbTagByIntersection().obs;
 
@@ -66,10 +71,16 @@ class AbModel {
   var listInitialized = false;
   var _maxPeerOneAb = 0;
 
+  late final Peers peersModel;
+
   WeakReference<FFI> parent;
 
   AbModel(this.parent) {
     addressbooks.clear();
+    peersModel = Peers(
+        name: PeersModelName.addressBook,
+        getInitPeers: () => currentAbPeers,
+        loadEvent: LoadEvent.addressBook);
     if (desktopType == DesktopType.main) {
       Timer.periodic(Duration(milliseconds: 500), (timer) async {
         if (_timerCounter++ % 6 == 0) {
@@ -111,9 +122,10 @@ class AbModel {
   Future<void> _pullAb(
       {required ForcePullAb? force, required bool quiet}) async {
     if (bind.isDisableAb()) return;
-    debugPrint("pullAb, force: $force, quiet: $quiet");
     if (!gFFI.userModel.isLogin) return;
+    if (gFFI.userModel.networkError.isNotEmpty) return;
     if (force == null && listInitialized && current.initialized) return;
+    debugPrint("pullAb, force: $force, quiet: $quiet");
     if (!listInitialized || force == ForcePullAb.listAndCurrent) {
       try {
         // Read personal guid every time to avoid upgrading the server without closing the main window
@@ -179,6 +191,7 @@ class AbModel {
         debugPrint("pull current Ab error: $e");
       }
     }
+    _callbackPeerUpdate();
     if (listInitialized && current.initialized) {
       _saveCache();
     }
@@ -195,7 +208,7 @@ class AbModel {
         return false;
       }
       Map<String, dynamic> json =
-          _jsonDecodeRespMap(utf8.decode(resp.bodyBytes), resp.statusCode);
+          _jsonDecodeRespMap(decode_http_response(resp), resp.statusCode);
       if (json.containsKey('error')) {
         throw json['error'];
       }
@@ -221,7 +234,7 @@ class AbModel {
         return false;
       }
       Map<String, dynamic> json =
-          _jsonDecodeRespMap(utf8.decode(resp.bodyBytes), resp.statusCode);
+          _jsonDecodeRespMap(decode_http_response(resp), resp.statusCode);
       if (json.containsKey('error')) {
         throw json['error'];
       }
@@ -258,7 +271,7 @@ class AbModel {
         headers['Content-Type'] = "application/json";
         final resp = await http.post(uri, headers: headers);
         Map<String, dynamic> json =
-            _jsonDecodeRespMap(utf8.decode(resp.bodyBytes), resp.statusCode);
+            _jsonDecodeRespMap(decode_http_response(resp), resp.statusCode);
         if (json.containsKey('error')) {
           throw json['error'];
         }
@@ -333,6 +346,9 @@ class AbModel {
     final ab = addressbooks[name];
     if (ab == null) {
       return 'no such addressbook: $name';
+    }
+    for (var p in ps) {
+      ab.removeNonExistentTags(p);
     }
     String? errMsg = await ab.addPeers(ps);
     await pullNonLegacyAfterChange(name: name);
@@ -410,6 +426,7 @@ class AbModel {
         }
       });
     }
+    _callbackPeerUpdate();
     return ret;
   }
 
@@ -417,6 +434,7 @@ class AbModel {
 
 // #region tags
   Future<bool> addTags(List<String> tagList) async {
+    tagList.removeWhere((e) => e == kUntagged);
     final ret = await current.addTags(tagList, {});
     await pullNonLegacyAfterChange();
     _saveCache();
@@ -610,6 +628,9 @@ class AbModel {
           }
         }
       }
+      if (abEntries.isNotEmpty) {
+        _callbackPeerUpdate();
+      }
     }
   }
 
@@ -638,6 +659,9 @@ class AbModel {
   }
 
   Color getCurrentAbTagColor(String tag) {
+    if (tag == kUntagged) {
+      return MyTheme.accent;
+    }
     int? colorValue = current.tagColors[tag];
     if (colorValue != null) {
       return Color(colorValue);
@@ -729,6 +753,20 @@ class AbModel {
     }
   }
 
+  void _callbackPeerUpdate() {
+    for (var listener in _peerIdUpdateListeners.values) {
+      listener();
+    }
+  }
+
+  void addPeerUpdateListener(String key, VoidCallback listener) {
+    _peerIdUpdateListeners[key] = listener;
+  }
+
+  void removePeerUpdateListener(String key) {
+    _peerIdUpdateListeners.remove(key);
+  }
+
 // #endregion
 }
 
@@ -740,7 +778,10 @@ abstract class BaseAb {
 
   final pullError = "".obs;
   final pushError = "".obs;
-  final abLoading = false.obs;
+  final abLoading = false
+      .obs; // Indicates whether the UI should show a loading state for the address book.
+  var abPulling =
+      false; // Tracks whether a pull operation is currently in progress to prevent concurrent pulls. Unlike abLoading, this is not tied to UI updates.
   bool initialized = false;
 
   String name();
@@ -755,17 +796,22 @@ abstract class BaseAb {
   }
 
   Future<void> pullAb({quiet = false}) async {
-    debugPrint("pull ab \"${name()}\"");
-    if (abLoading.value) return;
+    if (abPulling) return;
+    abPulling = true;
     if (!quiet) {
       abLoading.value = true;
       pullError.value = "";
     }
     initialized = false;
+    debugPrint("pull ab \"${name()}\"");
     try {
       initialized = await pullAbImpl(quiet: quiet);
-    } catch (_) {}
-    abLoading.value = false;
+    } catch (e) {
+      debugPrint("Error occurred while pulling address book: $e");
+    } finally {
+      abLoading.value = false;
+      abPulling = false;
+    }
   }
 
   Future<bool> pullAbImpl({quiet = false});
@@ -777,6 +823,18 @@ abstract class BaseAb {
 
   removePassword(Map<String, dynamic> p) {
     p.remove('password');
+  }
+
+  removeNonExistentTags(Map<String, dynamic> p) {
+    try {
+      final oldTags = p.remove('tags');
+      if (oldTags is List) {
+        final newTags = oldTags.where((e) => tagContainBy(e)).toList();
+        p['tags'] = newTags;
+      }
+    } catch (e) {
+      print("removeNonExistentTags: $e");
+    }
   }
 
   Future<bool> changeTagForPeers(List<String> ids, List<dynamic> tags);
@@ -815,8 +873,6 @@ abstract class BaseAb {
 }
 
 class LegacyAb extends BaseAb {
-  final sortTags = shouldSortTags().obs;
-  final filterByIntersection = filterAbTagByIntersection().obs;
   bool get emtpy => peers.isEmpty && tags.isEmpty;
   // licensedDevices is obtained from personal ab, shared ab restrict it in server
   var licensedDevices = 0;
@@ -869,7 +925,7 @@ class LegacyAb extends BaseAb {
         peers.clear();
       } else if (resp.body.isNotEmpty) {
         Map<String, dynamic> json =
-            _jsonDecodeRespMap(utf8.decode(resp.bodyBytes), resp.statusCode);
+            _jsonDecodeRespMap(decode_http_response(resp), resp.statusCode);
         if (json.containsKey('error')) {
           throw json['error'];
         } else if (json.containsKey('data')) {
@@ -927,7 +983,7 @@ class LegacyAb extends BaseAb {
         ret = true;
       } else {
         Map<String, dynamic> json =
-            _jsonDecodeRespMap(utf8.decode(resp.bodyBytes), resp.statusCode);
+            _jsonDecodeRespMap(decode_http_response(resp), resp.statusCode);
         if (json.containsKey('error')) {
           throw json['error'];
         } else if (resp.statusCode == 200) {
@@ -1209,8 +1265,6 @@ class LegacyAb extends BaseAb {
 class Ab extends BaseAb {
   AbProfile profile;
   late final bool personal;
-  final sortTags = shouldSortTags().obs;
-  final filterByIntersection = filterAbTagByIntersection().obs;
   bool get emtpy => peers.isEmpty && tags.isEmpty;
 
   Ab(this.profile, this.personal);
@@ -1305,7 +1359,7 @@ class Ab extends BaseAb {
         final resp = await http.post(uri, headers: headers);
         statusCode = resp.statusCode;
         Map<String, dynamic> json =
-            _jsonDecodeRespMap(utf8.decode(resp.bodyBytes), resp.statusCode);
+            _jsonDecodeRespMap(decode_http_response(resp), resp.statusCode);
         if (json.containsKey('error')) {
           throw json['error'];
         }
@@ -1362,7 +1416,7 @@ class Ab extends BaseAb {
       final resp = await http.post(uri, headers: headers);
       statusCode = resp.statusCode;
       List<dynamic> json =
-          _jsonDecodeRespList(utf8.decode(resp.bodyBytes), resp.statusCode);
+          _jsonDecodeRespList(decode_http_response(resp), resp.statusCode);
       if (resp.statusCode != 200) {
         throw 'HTTP ${resp.statusCode}';
       }
